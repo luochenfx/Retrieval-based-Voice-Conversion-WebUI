@@ -18,7 +18,7 @@ logging.getLogger("numba").setLevel(logging.WARNING)
 n_part = int(sys.argv[1])
 i_part = int(sys.argv[2])
 i_gpu = sys.argv[3]
-os.environ["CUDA_VISIBLE_DEVICES"] = str(i_gpu)
+# os.environ["CUDA_VISIBLE_DEVICES"] = str(i_gpu)
 exp_dir = sys.argv[4]
 is_half = sys.argv[5]
 f = open("%s/extract_f0_feature.log" % exp_dir, "a+")

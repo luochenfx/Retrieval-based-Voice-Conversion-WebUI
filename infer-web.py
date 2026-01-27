@@ -31,10 +31,23 @@ import traceback
 import threading
 import shutil
 import logging
+import matplotlib
+matplotlib.use('Agg')
 
-
-logging.getLogger("numba").setLevel(logging.WARNING)
-logging.getLogger("httpx").setLevel(logging.WARNING)
+for logger_name in [
+    "PIL", "PIL.Image",
+    "h5py", "h5py._conv",
+    "tensorflow", "tf",
+    "matplotlib", "matplotlib.font_manager",
+    "numba",
+    "markdown_it",
+    "httpx", "httpcore",
+    "urllib3",
+    "asyncio",
+    "gradio",
+    "fairseq",
+]:
+    logging.getLogger(logger_name).setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
 
@@ -147,7 +160,7 @@ def lookup_indices(index_root):
     for root, dirs, files in os.walk(index_root, topdown=False):
         for name in files:
             if name.endswith(".index") and "trained" not in name:
-                index_paths.append("%s/%s" % (root, name))
+                index_paths.append("%s/%s" % (str(root), str(name)))
 
 
 lookup_indices(index_root)
@@ -687,28 +700,29 @@ def train_index(exp_dir1, version19):
         "成功构建索引 added_IVF%s_Flat_nprobe_%s_%s_%s.index"
         % (n_ivf, index_ivf.nprobe, exp_dir1, version19)
     )
-    try:
-        link = os.link if platform.system() == "Windows" else os.symlink
-        link(
-            "%s/added_IVF%s_Flat_nprobe_%s_%s_%s.index"
-            % (exp_dir, n_ivf, index_ivf.nprobe, exp_dir1, version19),
-            "%s/%s_IVF%s_Flat_nprobe_%s_%s_%s.index"
-            % (
-                outside_index_root,
-                exp_dir1,
-                n_ivf,
-                index_ivf.nprobe,
-                exp_dir1,
-                version19,
-            ),
-        )
-        infos.append("链接索引到外部-%s" % (outside_index_root))
-    except:
-        infos.append("链接索引到外部-%s失败" % (outside_index_root))
+    # 不再软链接至 assets/indices
+    # try:
+    #     link = os.link if platform.system() == "Windows" else os.symlink
+    #     link(
+    #         "%s/added_IVF%s_Flat_nprobe_%s_%s_%s.index"
+    #         % (exp_dir, n_ivf, index_ivf.nprobe, exp_dir1, version19),
+    #         "%s/%s_IVF%s_Flat_nprobe_%s_%s_%s.index"
+    #         % (
+    #             outside_index_root,
+    #             exp_dir1,
+    #             n_ivf,
+    #             index_ivf.nprobe,
+    #             exp_dir1,
+    #             version19,
+    #         ),
+    #     )
+    #     infos.append("链接索引到外部-%s" % (outside_index_root))
+    # except:
+    #     infos.append("链接索引到外部-%s失败" % (outside_index_root))
 
     # faiss.write_index(index, '%s/added_IVF%s_Flat_FastScan_%s.index'%(exp_dir,n_ivf,version19))
     # infos.append("成功构建索引，added_IVF%s_Flat_FastScan_%s.index"%(n_ivf,version19))
-    yield "\n".join(infos)
+    return "\n".join(infos)
 
 
 # but5.click(train1key, [exp_dir1, sr2, if_f0_3, trainset_dir4, spk_id5, gpus6, np7, f0method8, save_epoch10, total_epoch11, batch_size12, if_save_latest13, pretrained_G14, pretrained_D15, gpus16, if_cache_gpu17], info3)
@@ -744,12 +758,9 @@ def train1key(
 
     # step2a:提取音高
     yield get_info_str(i18n("step2:正在提取音高&正在提取特征"))
-    [
-        get_info_str(_)
-        for _ in extract_f0_feature(
-            gpus16, np7, f0method8, if_f0_3, exp_dir1, version19, gpus_rmvpe
-        )
-    ]
+    # 列表推导阻塞子生成器，改用 for-yield 实时输出
+    for line in extract_f0_feature(gpus16, np7, f0method8, if_f0_3, exp_dir1, version19, gpus_rmvpe):
+        yield get_info_str(line.strip())
 
     # step3a:训练模型
     yield get_info_str(i18n("step3a:正在训练模型"))
@@ -774,8 +785,17 @@ def train1key(
     )
 
     # step3b:训练索引
-    [get_info_str(_) for _ in train_index(exp_dir1, version19)]
-    yield get_info_str(i18n("全流程结束！"))
+    # [get_info_str(_) for _ in train_index(exp_dir1, version19)]
+    for line in train_index(exp_dir1, version19):
+        # logger.info(get_info_str(line.strip()))
+        pass
+    end_msg = i18n("全流程结束！")
+    yield get_info_str(end_msg)
+    logger.info(end_msg)
+    tensorboard_cmd = f"tensorboard --logdir={now_dir}/logs/{exp_dir1} --port=6006"
+    yield get_info_str(i18n("数据可视化:"))
+    yield get_info_str(tensorboard_cmd)
+    logger.info(tensorboard_cmd)
 
 
 #                    ckpt_path2.change(change_info_,[ckpt_path2],[sr__,if_f0__])
@@ -816,7 +836,10 @@ with gr.Blocks(title="RVC WebUI") as app:
     with gr.Tabs():
         with gr.TabItem(i18n("模型推理")):
             with gr.Row():
-                sid0 = gr.Dropdown(label=i18n("推理音色"), choices=sorted(names))
+                sid0 = gr.Dropdown(
+                    label=i18n("推理音色"),
+                    choices=sorted(names)
+                )
                 with gr.Column():
                     refresh_button = gr.Button(
                         i18n("刷新音色列表和索引路径"), variant="primary"
@@ -1212,7 +1235,7 @@ with gr.Blocks(title="RVC WebUI") as app:
                 with gr.Row():
                     trainset_dir4 = gr.Textbox(
                         label=i18n("输入训练文件夹路径"),
-                        value=i18n("E:\\语音音频+标注\\米津玄师\\src"),
+                        value=i18n("raw/"),
                     )
                     spk_id5 = gr.Slider(
                         minimum=0,
@@ -1609,9 +1632,9 @@ with gr.Blocks(title="RVC WebUI") as app:
                 gr.Markdown(traceback.format_exc())
 
     if config.iscolab:
-        app.queue(concurrency_count=511, max_size=1022).launch(share=True)
+        app.queue(concurrency_count=8, max_size=16).launch(share=True)
     else:
-        app.queue(concurrency_count=511, max_size=1022).launch(
+        app.queue(concurrency_count=8, max_size=16).launch(
             server_name="0.0.0.0",
             inbrowser=not config.noautoopen,
             server_port=config.listen_port,

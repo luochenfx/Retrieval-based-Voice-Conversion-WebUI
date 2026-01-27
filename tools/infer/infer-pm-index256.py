@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 import parselmouth
 import torch
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+# os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 # import torchcrepe
 from time import time as ttime
 

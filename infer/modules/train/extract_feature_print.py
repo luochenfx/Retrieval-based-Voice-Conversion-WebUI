@@ -15,7 +15,7 @@ if len(sys.argv) == 7:
 else:
     i_gpu = sys.argv[4]
     exp_dir = sys.argv[5]
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(i_gpu)
+    # os.environ["CUDA_VISIBLE_DEVICES"] = str(i_gpu)
     version = sys.argv[6]
     is_half = sys.argv[7].lower() == "true"
 import fairseq
