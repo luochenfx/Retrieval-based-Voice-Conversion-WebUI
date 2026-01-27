@@ -235,7 +235,12 @@ def plot_spectrogram_to_numpy(spectrogram):
     plt.tight_layout()
 
     fig.canvas.draw()
-    data = np.fromstring(fig.canvas.tostring_rgb(), dtype=np.uint8, sep="")
+    # data = np.fromstring(fig.canvas.tostring_rgb(), dtype=np.uint8, sep="")
+    # 如果Matplotlib版本较高
+    buf = fig.canvas.buffer_rgba()
+    data = np.asarray(buf)[..., :3]
+    data = data.astype(np.uint8).ravel()
+
     data = data.reshape(fig.canvas.get_width_height()[::-1] + (3,))
     plt.close()
     return data
@@ -266,7 +271,10 @@ def plot_alignment_to_numpy(alignment, info=None):
     plt.tight_layout()
 
     fig.canvas.draw()
-    data = np.fromstring(fig.canvas.tostring_rgb(), dtype=np.uint8, sep="")
+    # data = np.fromstring(fig.canvas.tostring_rgb(), dtype=np.uint8, sep="")
+    buf = fig.canvas.buffer_rgba()
+    data = np.asarray(buf)[..., :3]
+    data = data.astype(np.uint8).ravel()
     data = data.reshape(fig.canvas.get_width_height()[::-1] + (3,))
     plt.close()
     return data
