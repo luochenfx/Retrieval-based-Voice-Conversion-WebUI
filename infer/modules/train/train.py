@@ -54,7 +54,7 @@ import torch.multiprocessing as mp
 from torch.nn import functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
+from tensorboardX import SummaryWriter
 
 from infer.lib.infer_pack import commons
 from infer.lib.train.data_utils import (
@@ -86,10 +86,12 @@ from infer.lib.train.losses import (
 )
 from infer.lib.train.mel_processing import mel_spectrogram_torch, spec_to_mel_torch
 from infer.lib.train.process_ckpt import savee
+from grad_clip import CoupledAdaptiveGradClip
 
 global_step = 0
-device = "cuda"
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 show_postfix = os.environ.get('RVC_SHOW_POSTFIX', '0').lower() in ('1', 'true', 'yes')
+use_agc = os.environ.get('USE_AGC', '0').lower() in ('1', 'true', 'yes')
 
 
 class EpochRecorder:
@@ -147,7 +149,8 @@ def run(rank, n_gpus, hps, logger: logging.Logger):
     torch.manual_seed(hps.train.seed)
     if torch.cuda.is_available():
         torch.cuda.set_device(rank)
-
+    if torch.cuda.is_bf16_supported():
+        print("[ROCm] BF16 supported, recommended for training")
     if hps.if_f0 == 1:
         train_dataset = TextAudioLoaderMultiNSFsid(hps.data.training_files, hps.data)
     else:
@@ -171,7 +174,7 @@ def run(rank, n_gpus, hps, logger: logging.Logger):
         train_dataset,
         num_workers=4,
         shuffle=False,
-        pin_memory=True,
+        pin_memory=False,
         collate_fn=collate_fn,
         batch_sampler=train_sampler,
         persistent_workers=True,
@@ -278,8 +281,21 @@ def run(rank, n_gpus, hps, logger: logging.Logger):
     )
 
     scaler = GradScaler(enabled=hps.train.fp16_run)
-
+    agc = None
+    if use_agc:
+        logger.info(f"自动进行梯度裁剪")
+        agc = CoupledAdaptiveGradClip(
+            ratio_g_to_d=2.0,
+            base_percentile=85.0,  # 快速响应梯度异常，适配ROCm
+            buffer_base=1.15,  # 保守缓冲，避免阈值过高触发OOM
+            min_threshold=20.0,  # ROCm安全下限，防止过度裁剪
+            max_threshold=120.0,  # ROCm OOM红线，严格限制阈值上限
+            history_size=30,  # 短窗口快速适应梯度变化
+            warmup_steps=3,
+            device=device.type
+        )
     cache = []
+    logger.info(f"epochs: {hps.train.epochs}")
     for epoch in range(epoch_str, hps.train.epochs + 1):
         if rank == 0:
             train_and_evaluate(
@@ -294,6 +310,7 @@ def run(rank, n_gpus, hps, logger: logging.Logger):
                 logger,
                 [writer, writer_eval],
                 cache,
+                agc
             )
         else:
             train_and_evaluate(
@@ -308,13 +325,14 @@ def run(rank, n_gpus, hps, logger: logging.Logger):
                 None,
                 None,
                 cache,
+                agc
             )
         scheduler_g.step()
         scheduler_d.step()
 
 
 def train_and_evaluate(
-    rank, epoch, hps, nets, optims, schedulers, scaler, loaders, logger, writers, cache
+    rank, epoch, hps, nets, optims, schedulers, scaler, loaders, logger, writers, cache, agc=None
 ):
     net_g, net_d = nets
     optim_g, optim_d = optims
@@ -324,10 +342,8 @@ def train_and_evaluate(
 
     train_loader.batch_sampler.set_epoch(epoch)
     global global_step
-
     net_g.train()
     net_d.train()
-
     # ── 数据迭代器准备 ────────────────────────────────────────────────────────
     if hps.if_cache_data_in_gpu:
         # 每个 epoch 都强制重建缓存（安全）
@@ -374,10 +390,12 @@ def train_and_evaluate(
         iterator_length = len(train_loader)
 
     if iterator_length > 0:
-        hps.train.log_interval = max(1, iterator_length // 5)
+        train_e_total = hps.train.epochs * iterator_length
+        log_interval = max(1, train_e_total // 20)
+        hps.train.log_interval = min(hps.train.log_interval, log_interval)
     else:
         hps.train.log_interval = 1
-    # logger.info(f"自适应 log_interval: {hps.train.log_interval} (基于 {iterator_length} batch/epoch)")
+    logger.info(f" log_interval: {hps.train.log_interval} ")
     # ── 训练循环 ───────────────────────────────────────────────────────────────
     epoch_recorder = EpochRecorder()
     pbar = tqdm(
@@ -396,8 +414,18 @@ def train_and_evaluate(
         else:
             phone, phone_lengths, spec, spec_lengths, wave, wave_lengths, sid = batch_data
 
+        if not hps.if_cache_data_in_gpu and torch.cuda.is_available():
+            phone = phone.to(device, non_blocking=True)
+            phone_lengths = phone_lengths.to(device, non_blocking=True)
+            if hps.if_f0 == 1:
+                pitch = pitch.to(device, non_blocking=True)
+                pitchf = pitchf.to(device, non_blocking=True)
+            sid = sid.to(device, non_blocking=True)
+            spec = spec.to(device, non_blocking=True)
+            spec_lengths = spec_lengths.to(device, non_blocking=True)
+            wave = wave.to(device, non_blocking=True)
         # Calculate ─────────────────────────────────────────────────────────────
-        with autocast(device, enabled=hps.train.fp16_run):
+        with autocast(device.type, enabled=hps.train.fp16_run):
             if hps.if_f0 == 1:
                 y_hat, ids_slice, x_mask, z_mask, (z, z_p, m_p, logs_p, m_q, logs_q) = net_g(
                     phone, phone_lengths, pitch, pitchf, spec, spec_lengths, sid
@@ -419,7 +447,7 @@ def train_and_evaluate(
                 mel, ids_slice, hps.train.segment_size // hps.data.hop_length
             )
 
-            with autocast(device, enabled=False):
+            with autocast(device.type, enabled=False):
                 y_hat_mel = mel_spectrogram_torch(
                     y_hat.float().squeeze(1),
                     hps.data.filter_length,
@@ -440,7 +468,7 @@ def train_and_evaluate(
 
             # Discriminator
             y_d_hat_r, y_d_hat_g, _, _ = net_d(wave, y_hat.detach())
-            with autocast(device, enabled=False):
+            with autocast(device.type, enabled=False):
                 loss_disc, losses_disc_r, losses_disc_g = discriminator_loss(
                     y_d_hat_r, y_d_hat_g
                 )
@@ -448,13 +476,18 @@ def train_and_evaluate(
         optim_d.zero_grad()
         scaler.scale(loss_disc).backward()
         scaler.unscale_(optim_d)
-        grad_norm_d = commons.clip_grad_value_(net_d.parameters(), None)
+        if use_agc and agc is not None:
+            params_d = net_d.module.parameters() if hasattr(net_d, "module") else net_d.parameters()
+            raw_d, clip_d = agc.clip_d(params_d)
+            grad_norm_d = raw_d
+        else:
+            grad_norm_d = commons.clip_grad_value_(net_d.parameters(), None)
         scaler.step(optim_d)
 
-        with autocast(device, enabled=hps.train.fp16_run):
+        with autocast(device.type, enabled=hps.train.fp16_run):
             # Generator
             y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = net_d(wave, y_hat)
-            with autocast(device, enabled=False):
+            with autocast(device.type, enabled=False):
                 loss_mel = F.l1_loss(y_mel, y_hat_mel) * hps.train.c_mel
                 loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * hps.train.c_kl
                 loss_fm = feature_loss(fmap_r, fmap_g)
@@ -464,7 +497,12 @@ def train_and_evaluate(
         optim_g.zero_grad()
         scaler.scale(loss_gen_all).backward()
         scaler.unscale_(optim_g)
-        grad_norm_g = commons.clip_grad_value_(net_g.parameters(), None)
+        if use_agc and agc is not None:
+            params_g = net_g.module.parameters() if hasattr(net_g, "module") else net_g.parameters()
+            raw_g, clip_g = agc.clip_g(params_g)
+            grad_norm_g = raw_g
+        else:
+            grad_norm_g = commons.clip_grad_value_(net_g.parameters(), None)
         scaler.step(optim_g)
         scaler.update()
 
@@ -484,9 +522,22 @@ def train_and_evaluate(
                 "loss/g/mel": display_mel,
                 "loss/g/kl": display_kl,
             }
-            scalar_dict.update({f"loss/g/{i}": v for i, v in enumerate(losses_gen)})
-            scalar_dict.update({f"loss/d_r/{i}": v for i, v in enumerate(losses_disc_r)})
-            scalar_dict.update({f"loss/d_g/{i}": v for i, v in enumerate(losses_disc_g)})
+            scalar_dict.update({f"gen_adv/{i}": v for i, v in enumerate(losses_gen)})
+            scalar_dict.update({f"disc_real/{i}": v for i, v in enumerate(losses_disc_r)})
+            scalar_dict.update({f"disc_gen/{i}": v for i, v in enumerate(losses_disc_g)})
+
+            if use_agc and agc is not None:
+                clip_ratio_d = agc.get_clip_ratio(raw_d, clip_d)
+                clip_ratio_g = agc.get_clip_ratio(raw_g, clip_g)
+                scalar_dict.update({
+                    "agc/clip_norm_d": clip_d,
+                    "agc/clip_ratio_d": clip_ratio_d,
+                    "agc/clip_norm_g": clip_g,
+                    "agc/clip_ratio_g": clip_ratio_g,
+                    "agc/threshold_d": agc.current_th_d,
+                    "agc/threshold_g": agc.current_th_g,
+                    "agc/gd_ratio": agc.current_th_g / agc.current_th_d if agc.current_th_d > 1e-6 else 2.0
+                })
 
             image_dict = {}
             if global_step % (hps.train.log_interval * 10) == 0:
